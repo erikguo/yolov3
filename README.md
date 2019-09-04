@@ -1,3 +1,10 @@
+I combined SLIMYOLO here.
+
+You can train sparsity with train-sparsity.py, and use prune.py to pruning.
+
+
+
+
 <table style="width:100%">
   <tr>
     <td>
