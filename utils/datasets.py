@@ -117,13 +117,16 @@ class LoadImages:  # for inference
 
 
 class LoadWebcam:  # for inference
-    def __init__(self, img_size=416, half=False):
+    def __init__(self, pipe=0, img_size=416, half=False):
         self.img_size = img_size
         self.half = half  # half precision fp16 images
 
-        pipe = 0  # local camera
+        if pipe == '0':
+            pipe = 0  # local camera
         # pipe = 'rtsp://192.168.1.64/1'  # IP camera
         # pipe = 'rtsp://username:password@192.168.1.64/1'  # IP camera with login
+        # pipe = 'rtsp://170.93.143.139/rtplive/470011e600ef003a004ee33696235daa'  # IP traffic camera
+        # pipe = 'http://wmccpinetop.axiscam.net/mjpg/video.mjpg'  # IP golf camera
 
         # https://answers.opencv.org/question/215996/changing-gstreamer-pipeline-to-opencv-in-pythonsolved/
         # pipe = '"rtspsrc location="rtsp://username:password@192.168.1.64/1" latency=10 ! appsink'  # GStreamer
@@ -132,7 +135,9 @@ class LoadWebcam:  # for inference
         # https://stackoverflow.com/questions/54095699/install-gstreamer-support-for-opencv-python-package  # install help
         # pipe = "rtspsrc location=rtsp://root:root@192.168.0.91:554/axis-media/media.amp?videocodec=h264&resolution=3840x2160 protocols=GST_RTSP_LOWER_TRANS_TCP ! rtph264depay ! queue ! vaapih264dec ! videoconvert ! appsink"  # GStreamer
 
+        self.pipe = pipe
         self.cap = cv2.VideoCapture(pipe)  # video capture object
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # set buffer size
 
     def __iter__(self):
         self.count = -1
@@ -141,14 +146,27 @@ class LoadWebcam:  # for inference
     def __next__(self):
         self.count += 1
         if cv2.waitKey(1) == 27:  # esc to quit
+            self.cap.release()
             cv2.destroyAllWindows()
             raise StopIteration
 
-        # Read image
-        ret_val, img0 = self.cap.read()
-        assert ret_val, 'Webcam Error'
+        # Read frame
+        if self.pipe == 0:  # local camera
+            ret_val, img0 = self.cap.read()
+            img0 = cv2.flip(img0, 1)  # flip left-right
+        else:  # IP camera
+            n = 0
+            while True:
+                n += 1
+                self.cap.grab()
+                if n % 30 == 0:  # skip frames
+                    ret_val, img0 = self.cap.retrieve()
+                    if ret_val:
+                        break
+
+        # Print
+        assert ret_val, 'Camera Error %s' % self.pipe
         img_path = 'webcam_%g.jpg' % self.count
-        img0 = cv2.flip(img0, 1)  # flip left-right
         print('webcam %g: ' % self.count, end='')
 
         # Padded resize

@@ -165,23 +165,26 @@ def test(cfg,
 
     # Save JSON
     if save_json and map and len(jdict):
-        imgIds = [int(Path(x).stem.split('_')[-1]) for x in dataset.img_files]
-        with open('results.json', 'w') as file:
-            json.dump(jdict, file)
+        try:
+            imgIds = [int(Path(x).stem.split('_')[-1]) for x in dataset.img_files]
+            with open('results.json', 'w') as file:
+                json.dump(jdict, file)
 
-        from pycocotools.coco import COCO
-        from pycocotools.cocoeval import COCOeval
+            from pycocotools.coco import COCO
+            from pycocotools.cocoeval import COCOeval
 
-        # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-        cocoGt = COCO('../coco/annotations/instances_val2014.json')  # initialize COCO ground truth api
-        cocoDt = cocoGt.loadRes('results.json')  # initialize COCO pred api
+            # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
+            cocoGt = COCO('../coco/annotations/instances_val2014.json')  # initialize COCO ground truth api
+            cocoDt = cocoGt.loadRes('results.json')  # initialize COCO pred api
 
-        cocoEval = COCOeval(cocoGt, cocoDt, 'bbox')
-        cocoEval.params.imgIds = imgIds  # [:32]  # only evaluate these images
-        cocoEval.evaluate()
-        cocoEval.accumulate()
-        cocoEval.summarize()
-        map = cocoEval.stats[1]  # update mAP to pycocotools mAP
+            cocoEval = COCOeval(cocoGt, cocoDt, 'bbox')
+            cocoEval.params.imgIds = imgIds  # [:32]  # only evaluate these images
+            cocoEval.evaluate()
+            cocoEval.accumulate()
+            cocoEval.summarize()
+            map = cocoEval.stats[1]  # update mAP to pycocotools mAP
+        except:
+            print('WARNING: missing dependency pycocotools from requirements.txt. Can not compute official COCO mAP.')
 
     # Return results
     maps = np.zeros(nc) + map
@@ -192,15 +195,15 @@ def test(cfg,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='test.py')
-    parser.add_argument('--batch-size', type=int, default=16, help='size of each image batch')
     parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='cfg file path')
     parser.add_argument('--data', type=str, default='data/coco.data', help='coco.data file path')
     parser.add_argument('--weights', type=str, default='weights/yolov3-spp.weights', help='path to weights file')
+    parser.add_argument('--batch-size', type=int, default=16, help='size of each image batch')
+    parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='iou threshold required to qualify as detected')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
     parser.add_argument('--nms-thres', type=float, default=0.5, help='iou threshold for non-maximum suppression')
     parser.add_argument('--save-json', action='store_true', help='save a cocoapi-compatible JSON results file')
-    parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
     opt = parser.parse_args()
     print(opt)
 

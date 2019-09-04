@@ -23,7 +23,7 @@ hyp = {'giou': 1.582,  # giou loss gain
        'obj': 21.35,  # obj loss gain (*=80 for uBCE with 80 classes)
        'obj_pw': 3.941,  # obj BCELoss positive_weight
        'iou_t': 0.2635,  # iou training threshold
-       'lr0': 0.002324,  # initial learning rate
+       'lr0': 0.002324,  # initial learning rate (SGD=1E-3, Adam=9E-5)
        'lrf': -4.,  # final LambdaLR learning rate = lr0 * (10 ** lrf)
        'momentum': 0.97,  # SGD momentum
        'weight_decay': 0.0004569,  # optimizer weight decay
@@ -39,17 +39,20 @@ def train():
     cfg = opt.cfg
     data = opt.data
     img_size = opt.img_size
-    epochs = 3 if opt.prebias else opt.epochs  # 500200 batches at bs 16, 117263 images = 273 epochs
+    epochs = 1 if opt.prebias else opt.epochs  # 500200 batches at bs 16, 117263 images = 273 epochs
     batch_size = opt.batch_size
     accumulate = opt.accumulate  # effective bs = batch_size * accumulate = 16 * 4 = 64
     weights = opt.weights  # initial training weights
+
+    if 'pw' not in opt.arc:  # remove BCELoss positive weights
+        hyp['cls_pw'] = 1.
+        hyp['obj_pw'] = 1.
 
     # Initialize
     init_seeds()
     wdir = 'weights' + os.sep  # weights dir
     last = wdir + 'last.pt'
     best = wdir + 'best.pt'
-    device = torch_utils.select_device(apex=mixed_precision)
     multi_scale = opt.multi_scale
 
     if multi_scale:
@@ -63,14 +66,26 @@ def train():
     train_path = data_dict['train']
     nc = int(data_dict['classes'])  # number of classes
 
+    # Remove previous results
+    for f in glob.glob('*_batch*.jpg') + glob.glob('results.txt'):
+        os.remove(f)
+
     # Initialize model
     model = Darknet(cfg, arc=opt.arc).to(device)
 
     # Optimizer
-    # optimizer = optim.Adam(model.parameters(), lr=hyp['lr0'], weight_decay=hyp['weight_decay'])
-    # optimizer = AdaBound(model.parameters(), lr=hyp['lr0'], final_lr=0.1)
-    optimizer = optim.SGD(model.parameters(), lr=hyp['lr0'], momentum=hyp['momentum'], weight_decay=hyp['weight_decay'],
-                          nesterov=True)
+    pg0, pg1 = [], []  # optimizer parameter groups
+    for k, v in dict(model.named_parameters()).items():
+        if 'Conv2d.weight' in k:
+            pg1 += [v]  # parameter group 1 (apply weight_decay)
+        else:
+            pg0 += [v]  # parameter group 0
+
+    # optimizer = optim.Adam(pg0, lr=hyp['lr0'])
+    # optimizer = AdaBound(pg0, lr=hyp['lr0'], final_lr=0.1)
+    optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+    optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
+    del pg0, pg1
 
     cutoff = -1  # backbone reaches to cutoff layer
     start_epoch = 0
@@ -108,17 +123,18 @@ def train():
     if opt.transfer or opt.prebias:  # transfer learning edge (yolo) layers
         nf = int(model.module_defs[model.yolo_layers[0] - 1]['filters'])  # yolo layer size (i.e. 255)
 
-        for x in optimizer.param_groups:
-            # lower param count allows more aggressive training settings: ~0.1 lr0, ~0.9 momentum
-            x['lr'] *= 100
-            x['momentum'] *= 0.9
+        for p in optimizer.param_groups:
+            # lower param count allows more aggressive training settings: i.e. SGD ~0.1 lr0, ~0.9 momentum
+            p['lr'] *= 100
+            if p.get('momentum') is not None:  # for SGD but not Adam
+                p['momentum'] *= 0.9
 
         for p in model.parameters():
-            if opt.prebias and p.numel() == nf:  # train yolo biases only
+            if opt.prebias and p.numel() == nf:  # train (yolo biases)
                 p.requires_grad = True
-            elif opt.transfer and p.shape[0] == nf:  # train yolo biases+weights only
+            elif opt.transfer and p.shape[0] == nf:  # train (yolo biases+weights)
                 p.requires_grad = True
-            else:
+            else:  # freeze layer
                 p.requires_grad = False
 
     # Scheduler https://github.com/ultralytics/yolov3/issues/238
@@ -161,7 +177,7 @@ def train():
                                   hyp=hyp,  # augmentation hyperparameters
                                   rect=opt.rect,  # rectangular training
                                   image_weights=opt.img_weights,
-                                  cache_images=opt.cache_images)
+                                  cache_images=False if opt.prebias else opt.cache_images)
 
     # Dataloader
     dataloader = torch.utils.data.DataLoader(dataset,
@@ -170,10 +186,6 @@ def train():
                                              shuffle=not opt.rect,  # Shuffle=True unless rectangular training is used
                                              pin_memory=True,
                                              collate_fn=dataset.collate_fn)
-
-    # Remove previous results
-    for f in glob.glob('*_batch*.jpg') + glob.glob('results.txt'):
-        os.remove(f)
 
     # Start training
     model.nc = nc  # attach number of classes to model
@@ -185,13 +197,10 @@ def train():
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # 'P', 'R', 'mAP', 'F1', 'val GIoU', 'val Objectness', 'val Classification'
     t0 = time.time()
+    print('Starting %s for %g epochs...' % ('prebias' if opt.prebias else 'training', epochs))
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
         print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
-
-        # Update scheduler
-        if epoch > 0:
-            scheduler.step()
 
         # Freeze backbone at epoch 0, unfreeze at epoch 1 (optional)
         freeze_backbone = False
@@ -245,13 +254,12 @@ def train():
 
             # Compute loss
             loss, loss_items = compute_loss(pred, targets, model)
-            if torch.isnan(loss):
-                print('WARNING: nan loss detected, ending training')
+            if not torch.isfinite(loss):
+                print('WARNING: non-finite loss, ending training ', loss_items)
                 return results
 
-            # Divide by accumulation count
-            if accumulate > 1:
-                loss /= accumulate
+            # Scale loss by nominal batch_size of 64
+            loss *= batch_size / 64
 
             # Compute gradient
             if mixed_precision:
@@ -270,8 +278,14 @@ def train():
             mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0  # (GB)
             s = ('%10s' * 2 + '%10.3g' * 6) % (
                 '%g/%g' % (epoch, epochs - 1), '%.3gG' % mem, *mloss, len(targets), img_size)
-            pbar.set_description(s)  # end batch -----------------------------------------------------------------------
+            pbar.set_description(s)
 
+            # end batch ------------------------------------------------------------------------------------------------
+
+        # Update scheduler
+        scheduler.step()
+
+        # Process epoch results
         final_epoch = epoch + 1 == epochs
         if opt.prebias:
             print_model_biases(model)
@@ -330,7 +344,9 @@ def train():
                 torch.save(chkpt, wdir + 'backup%g.pt' % epoch)
 
             # Delete checkpoint
-            del chkpt  # end epoch -------------------------------------------------------------------------------------
+            del chkpt
+
+        # end epoch ----------------------------------------------------------------------------------------------------
 
     # Report time
     plot_results()  # save as results.png
@@ -359,11 +375,13 @@ if __name__ == '__main__':
     parser.add_argument('--img-weights', action='store_true', help='select training images by weight')
     parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
     parser.add_argument('--weights', type=str, default='', help='initial weights')  # i.e. weights/darknet.53.conv.74
-    parser.add_argument('--arc', type=str, default='default', help='yolo architecture')  # default, uCE, uBCE
+    parser.add_argument('--arc', type=str, default='defaultpw', help='yolo architecture')  # defaultpw, uCE, uBCE
     parser.add_argument('--prebias', action='store_true', help='transfer-learn yolo biases prior to training')
+    parser.add_argument('--var', type=float, help='debug variable')
     opt = parser.parse_args()
     opt.weights = 'weights/last.pt' if opt.resume else opt.weights
     print(opt)
+    device = torch_utils.select_device(apex=mixed_precision)
 
     tb_writer = None
     if not opt.evolve:  # Train normally
@@ -380,7 +398,6 @@ if __name__ == '__main__':
             create_backbone('weights/last.pt')  # saved results as backbone.pt
             opt.weights = 'weights/backbone.pt'  # assign backbone
             opt.prebias = False  # disable prebias
-            print(opt)  # display options
 
         train()  # train normally
 
