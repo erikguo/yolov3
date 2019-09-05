@@ -77,16 +77,24 @@ def create_modules(module_defs, img_size, arc):
 
             # Initialize preceding Conv2d() bias (https://arxiv.org/pdf/1708.02002.pdf section 3.3)
             try:
-                if arc == 'default':
+                if arc == 'defaultpw':  # default with positive weights
                     b = [-4, -3.6]  # obj, cls
-                elif arc == 'uCE':  # unified CE (1 background + 80 classes)
-                    b = [10, -0.1]  # obj, cls
+                elif arc == 'default':  # default no pw (40 cls, 80 obj)
+                    b = [-5.5, -4.0]
                 elif arc == 'uBCE':  # unified BCE (80 classes)
-                    b = [0, -8.5]  # obj, cls
+                    b = [0, -8.5]
+                elif arc == 'uCE':  # unified CE (1 background + 80 classes)
+                    b = [10, -0.1]
+                elif arc == 'Fdefault':  # Focal default no pw (28 cls, 21 obj, no pw)
+                    b = [-2.1, -1.8]
+                elif arc == 'uFBCE':  # unified FocalBCE (5120 obj, 80 classes)
+                    b = [0, -6.5]
+                elif arc == 'uFCE':  # unified FocalCE (64 cls, 1 background + 80 classes)
+                    b = [7.7, -1.1]
 
                 bias = module_list[-1][0].bias.view(len(mask), -1)  # 255 to 3x85
-                bias[:, 4] += b[0]  # obj
-                bias[:, 5:] += b[1]  # cls
+                bias[:, 4] += b[0] - bias[:, 4].mean()  # obj
+                bias[:, 5:] += b[1] - bias[:, 5:].mean()  # cls
                 # bias = torch.load('weights/yolov3-spp.bias.pt')[yolo_index]  # list of tensors [3x85, 3x85, 3x85]
                 module_list[-1][0].bias = torch.nn.Parameter(bias.view(-1))
                 # utils.print_model_biases(model)
@@ -175,13 +183,13 @@ class YOLOLayer(nn.Module):
             # io[..., 2:4] = ((torch.sigmoid(io[..., 2:4]) * 2) ** 3) * self.anchor_wh  # wh power method
             io[..., :4] *= self.stride
 
-            if self.arc == 'default':
+            if 'default' in self.arc:  # seperate obj and cls
                 torch.sigmoid_(io[..., 4:])
-            elif self.arc == 'uCE':  # unified CE (1 background + 80 classes)
-                io[..., 4:] = F.softmax(io[..., 4:], dim=4)
-                io[..., 4] = 1
-            elif self.arc == 'uBCE':  # unified BCE (80 classes)
+            elif 'BCE' in self.arc:  # unified BCE (80 classes)
                 torch.sigmoid_(io[..., 5:])
+                io[..., 4] = 1
+            elif 'CE' in self.arc:  # unified CE (1 background + 80 classes)
+                io[..., 4:] = F.softmax(io[..., 4:], dim=4)
                 io[..., 4] = 1
 
             if self.nc == 1:
@@ -294,6 +302,7 @@ def load_darknet_weights(self, weights, cutoff=-1):
             os.system('curl -f ' + url + ' -o ' + weights)
         except IOError:
             print(msg)
+            os.system('rm ' + weights)  # remove partial downloads
     assert os.path.exists(weights), msg  # download missing weights from Google Drive
 
     # Establish cutoffs

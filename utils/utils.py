@@ -291,7 +291,7 @@ def wh_iou(box1, box2):
 class FocalLoss(nn.Module):
     # Wraps focal loss around existing loss_fcn() https://arxiv.org/pdf/1708.02002.pdf
     # i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=2.5)
-    def __init__(self, loss_fcn, alpha=1, gamma=2, reduction='mean'):
+    def __init__(self, loss_fcn, alpha=1, gamma=0.5, reduction='mean'):
         super(FocalLoss, self).__init__()
         loss_fcn.reduction = 'none'  # required to apply FL to each element
         self.loss_fcn = loss_fcn
@@ -301,8 +301,7 @@ class FocalLoss(nn.Module):
 
     def forward(self, input, target):
         loss = self.loss_fcn(input, target)
-        pt = torch.exp(-loss)
-        loss *= self.alpha * (1 - pt) ** self.gamma
+        loss *= self.alpha * (1.000001 - torch.exp(-loss)) ** self.gamma  # non-zero power for gradient stability
 
         if self.reduction == 'mean':
             return loss.mean()
@@ -322,8 +321,11 @@ def compute_loss(p, targets, model):  # predictions, targets, model
     # Define criteria
     BCEcls = nn.BCEWithLogitsLoss(pos_weight=ft([h['cls_pw']]))
     BCEobj = nn.BCEWithLogitsLoss(pos_weight=ft([h['obj_pw']]))
-    FBCE = nn.BCEWithLogitsLoss()
-    FCE = nn.CrossEntropyLoss()  # weight=model.class_weights
+    BCE = nn.BCEWithLogitsLoss()
+    CE = nn.CrossEntropyLoss()  # weight=model.class_weights
+
+    if 'F' in arc:  # add focal loss
+        BCEcls, BCEobj, BCE, CE = FocalLoss(BCEcls), FocalLoss(BCEobj), FocalLoss(BCE), FocalLoss(CE)
 
     # Compute losses
     for i, pi in enumerate(p):  # layer index, layer predictions
@@ -343,7 +345,7 @@ def compute_loss(p, targets, model):  # predictions, targets, model
             giou = bbox_iou(pbox.t(), tbox[i], x1y1x2y2=False, GIoU=True)  # giou computation
             lbox += (1.0 - giou).mean()  # giou loss
 
-            if arc == 'default' and model.nc > 1:  # cls loss (only if multiple classes)
+            if 'default' in arc and model.nc > 1:  # cls loss (only if multiple classes)
                 t = torch.zeros_like(ps[:, 5:])  # targets
                 t[range(nb), tcls[i]] = 1.0
                 lcls += BCEcls(ps[:, 5:], t)  # BCE
@@ -353,20 +355,20 @@ def compute_loss(p, targets, model):  # predictions, targets, model
             # with open('targets.txt', 'a') as file:
             #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
 
-        if arc == 'default':
+        if 'default' in arc:  # seperate obj and cls
             lobj += BCEobj(pi[..., 4], tobj)  # obj loss
 
-        elif arc == 'uCE':  # unified CE (1 background + 80 classes), hyps 20
-            t = torch.zeros_like(pi[..., 0], dtype=torch.long)  # targets
-            if nb:
-                t[b, a, gj, gi] = tcls[i] + 1
-            lcls += FCE(pi[..., 4:].view(-1, model.nc + 1), t.view(-1))
-
-        elif arc == 'uBCE':  # unified BCE (1 background + 80 classes), hyps 200-30
+        elif 'BCE' in arc:  # unified BCE (80 classes)
             t = torch.zeros_like(pi[..., 5:])  # targets
             if nb:
                 t[b, a, gj, gi, tcls[i]] = 1.0
-            lobj += FBCE(pi[..., 5:], t)
+            lobj += BCE(pi[..., 5:], t)
+
+        elif 'CE' in arc:  # unified CE (1 background + 80 classes)
+            t = torch.zeros_like(pi[..., 0], dtype=torch.long)  # targets
+            if nb:
+                t[b, a, gj, gi] = tcls[i] + 1
+            lcls += CE(pi[..., 4:].view(-1, model.nc + 1), t.view(-1))
 
     lbox *= h['giou']
     lobj *= h['obj']
@@ -554,8 +556,12 @@ def get_yolo_layers(model):
 def print_model_biases(model):
     # prints the bias neurons preceding each yolo layer
     print('\nModel Bias Summary (per output layer):')
+    multi_gpu = type(model) in (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel)
     for l in model.yolo_layers:  # print pretrained biases
-        b = model.module_list[l - 1][0].bias.view(3, -1)  # bias 3x85
+        if multi_gpu:
+            b = model.module.module_list[l - 1][0].bias.view(3, -1)  # bias 3x85
+        else:
+            b = model.module_list[l - 1][0].bias.view(3, -1)  # bias 3x85
         print('regression: %5.2f+/-%-5.2f ' % (b[:, :4].mean(), b[:, :4].std()),
               'objectness: %5.2f+/-%-5.2f ' % (b[:, 4].mean(), b[:, 4].std()),
               'classification: %5.2f+/-%-5.2f' % (b[:, 5:].mean(), b[:, 5:].std()))
